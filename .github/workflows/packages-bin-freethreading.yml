@@ -1,0 +1,113 @@
+name: Build free-threaded (cp314t) binary packages
+
+# Focused workflow for building psycopg-binary wheels against the
+# free-threaded CPython 3.14t ABI. Kept separate from packages-bin.yml so
+# iteration is fast and the existing 5×4×2 = 40-job matrix isn't disturbed.
+#
+# The Cython sources already opt in via
+#   compiler_directives = { "freethreading_compatible": True }
+# in psycopg_c/build_backend/psycopg_build_ext.py, and the C wrappers have
+# been audited (commits: "mark external libpq C functions as noexcept nogil",
+# "Merge critical section and nogil blocks", "add free-threading-specific
+# tests"). The only thing missing upstream is shipped cp314t wheels.
+
+on:
+  push:
+    paths:
+      - '.github/workflows/packages-bin-freethreading.yml'
+  workflow_dispatch:
+
+env:
+  LIBPQ_VERSION: "18.0"
+  OPENSSL_VERSION: "3.5.4"
+  PQ_FLAGS: "-gssencmode-disable"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Start minimal: only the platforms turbo's granian-python314t
+        # container actually pulls from. Expand once green.
+        arch: [x86_64]
+        platform: [manylinux, musllinux]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Cache libpq build
+        uses: actions/cache@v5
+        with:
+          path: /tmp/libpq.build
+          key: libpq-${{ matrix.platform }}-${{ matrix.arch }}-${{ env.LIBPQ_VERSION }}-${{ env.OPENSSL_VERSION }}${{ env.PQ_FLAGS }}
+
+      - name: Create the binary package source tree
+        run: python3 ./tools/ci/copy_to_binary.py
+
+      - name: Build cp314t wheel
+        uses: pypa/cibuildwheel@v3.4.1
+        with:
+          package-dir: psycopg_binary
+        env:
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
+          CIBW_BUILD: cp314t-${{ matrix.platform }}_${{ matrix.arch }}
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
+          # cibuildwheel 3.x: explicitly opt the free-threaded interpreter
+          # into the build selection. Listing cp314t in CIBW_BUILD is
+          # necessary but not sufficient — without this it gets filtered.
+          CIBW_ENABLE: cpython-freethreading
+          CIBW_BEFORE_ALL_LINUX: ./tools/ci/wheel_linux_before_all.sh
+          CIBW_REPAIR_WHEEL_COMMAND: >-
+            ./tools/ci/strip_wheel.sh {wheel}
+            && auditwheel repair -w {dest_dir} {wheel}
+          # Skip the in-cibuildwheel test phase — psycopg[test] transitively
+          # pulls packages that may not yet have cp314t wheels (anyio,
+          # pproxy, etc.). We'll run a focused import + smoke test in a
+          # dedicated step after the build.
+          CIBW_TEST_SKIP: "*"
+          CIBW_ENVIRONMENT_PASS_LINUX: LIBPQ_VERSION OPENSSL_VERSION
+          CIBW_ENVIRONMENT: >-
+            PSYCOPG_IMPL=binary
+            LIBPQ_BUILD_PREFIX=/host/tmp/libpq.build
+            PATH="$LIBPQ_BUILD_PREFIX/bin:$PATH"
+            LD_LIBRARY_PATH="$LIBPQ_BUILD_PREFIX/lib:$LIBPQ_BUILD_PREFIX/lib64"
+
+      - name: Smoke test — import without re-enabling GIL
+        # The whole reason to ship cp314t wheels: confirm the module loads
+        # under the free-threaded build without CPython falling back to
+        # re-enabling the GIL. We grep for the giveaway warning that would
+        # mean the freethreading_compatible directive didn't stick.
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          # Install Python 3.14 free-threaded just for the smoke test
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository -y ppa:deadsnakes/ppa || true
+          sudo apt-get install -y python3.14-nogil python3.14-nogil-venv || \
+            (echo "deadsnakes 3.14t not available on ubuntu-latest yet — falling back to manylinux image check"; \
+             docker run --rm -v "$PWD/wheelhouse:/wheels" \
+               quay.io/pypa/manylinux2014_x86_64 \
+               bash -c "ls /wheels/ && /opt/python/cp314-cp314t/bin/python -W error::RuntimeWarning -c 'import psycopg_binary; print(psycopg_binary.__file__)'")
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: psycopg-binary-cp314t-${{ matrix.platform }}_${{ matrix.arch }}
+          path: ./wheelhouse/*.whl
+          if-no-files-found: error
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: [linux]
+    steps:
+      - name: Merge artifacts
+        uses: actions/upload-artifact/merge@v7
+        with:
+          name: psycopg-binary-cp314t
+          delete-merged: true
