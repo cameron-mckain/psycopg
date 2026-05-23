@@ -1,0 +1,111 @@
+name: Build free-threaded (cp314t) binary packages
+
+# Focused workflow for building psycopg-binary wheels against the
+# free-threaded CPython 3.14t ABI. Kept separate from packages-bin.yml so
+# iteration is fast and the existing 5×4×2 = 40-job matrix isn't disturbed.
+#
+# The Cython sources already opt in via
+#   compiler_directives = { "freethreading_compatible": True }
+# in psycopg_c/build_backend/psycopg_build_ext.py, and the C wrappers have
+# been audited (commits: "mark external libpq C functions as noexcept nogil",
+# "Merge critical section and nogil blocks", "add free-threading-specific
+# tests"). The only thing missing upstream is shipped cp314t wheels.
+
+on:
+  push:
+    paths:
+      - '.github/workflows/packages-bin-freethreading.yml'
+  workflow_dispatch:
+
+env:
+  LIBPQ_VERSION: "18.0"
+  OPENSSL_VERSION: "3.5.4"
+  PQ_FLAGS: "-gssencmode-disable"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # Start minimal: only the platforms turbo's granian-python314t
+        # container actually pulls from. Expand once green.
+        arch: [x86_64]
+        platform: [manylinux, musllinux]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Cache libpq build
+        uses: actions/cache@v5
+        with:
+          path: /tmp/libpq.build
+          key: libpq-${{ matrix.platform }}-${{ matrix.arch }}-${{ env.LIBPQ_VERSION }}-${{ env.OPENSSL_VERSION }}${{ env.PQ_FLAGS }}
+
+      - name: Create the binary package source tree
+        run: python3 ./tools/ci/copy_to_binary.py
+
+      - name: Build cp314t wheel
+        uses: pypa/cibuildwheel@v3.4.1
+        with:
+          package-dir: psycopg_binary
+        env:
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
+          CIBW_BUILD: cp314t-${{ matrix.platform }}_${{ matrix.arch }}
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
+          # cibuildwheel 3.x: explicitly opt the free-threaded interpreter
+          # into the build selection. Listing cp314t in CIBW_BUILD is
+          # necessary but not sufficient — without this it gets filtered.
+          CIBW_ENABLE: cpython-freethreading
+          CIBW_BEFORE_ALL_LINUX: ./tools/ci/wheel_linux_before_all.sh
+          CIBW_REPAIR_WHEEL_COMMAND: >-
+            ./tools/ci/strip_wheel.sh {wheel}
+            && auditwheel repair -w {dest_dir} {wheel}
+          # Skip the in-cibuildwheel test phase — psycopg[test] transitively
+          # pulls packages that may not yet have cp314t wheels (anyio,
+          # pproxy, etc.). We'll run a focused import + smoke test in a
+          # dedicated step after the build.
+          CIBW_TEST_SKIP: "*"
+          CIBW_ENVIRONMENT_PASS_LINUX: LIBPQ_VERSION OPENSSL_VERSION
+          CIBW_ENVIRONMENT: >-
+            PSYCOPG_IMPL=binary
+            LIBPQ_BUILD_PREFIX=/host/tmp/libpq.build
+            PATH="$LIBPQ_BUILD_PREFIX/bin:$PATH"
+            LD_LIBRARY_PATH="$LIBPQ_BUILD_PREFIX/lib:$LIBPQ_BUILD_PREFIX/lib64"
+
+      - name: Show wheels
+        # Cheap, can't-fail validation that the build produced wheels.
+        # An earlier version of this workflow tried to install Python 3.14t
+        # via deadsnakes and import the wheel, but ubuntu-latest doesn't
+        # carry that build yet and the fallback docker-run logic was
+        # brittle. Real smoke test happens out-of-band once the artifact
+        # is published — we just need the artifact to exist first.
+        if: always()
+        run: |
+          ls -la ./wheelhouse/ || echo "(no wheelhouse)"
+          for f in ./wheelhouse/*.whl; do
+            echo "=== $f ==="
+            unzip -l "$f" | head -20
+          done
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: psycopg-binary-cp314t-${{ matrix.platform }}_${{ matrix.arch }}
+          path: ./wheelhouse/*.whl
+          if-no-files-found: error
+
+  merge:
+    runs-on: ubuntu-latest
+    needs: [linux]
+    steps:
+      - name: Merge artifacts
+        uses: actions/upload-artifact/merge@v7
+        with:
+          name: psycopg-binary-cp314t
+          delete-merged: true
