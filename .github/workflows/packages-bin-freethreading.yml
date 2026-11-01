@@ -1,7 +1,7 @@
-name: Build free-threaded (cp314t) binary packages
+name: Build free-threaded (cp314t, cp315t) binary packages
 
 # Focused workflow for building psycopg-binary wheels against the
-# free-threaded CPython 3.14t ABI. Kept separate from packages-bin.yml so
+# free-threaded CPython 3.14t / 3.15t ABIs. Kept separate from packages-bin.yml so
 # iteration is fast and the existing 5×4×2 = 40-job matrix isn't disturbed.
 #
 # The Cython sources already opt in via
@@ -9,7 +9,7 @@ name: Build free-threaded (cp314t) binary packages
 # in psycopg_c/build_backend/psycopg_build_ext.py, and the C wrappers have
 # been audited (commits: "mark external libpq C functions as noexcept nogil",
 # "Merge critical section and nogil blocks", "add free-threading-specific
-# tests"). The only thing missing upstream is shipped cp314t wheels.
+# tests"). The only thing missing upstream is shipped cp314t/cp315t wheels.
 
 on:
   push:
@@ -18,8 +18,8 @@ on:
   workflow_dispatch:
 
 env:
-  LIBPQ_VERSION: "18.0"
-  OPENSSL_VERSION: "3.5.4"
+  LIBPQ_VERSION: "18.6"
+  OPENSSL_VERSION: "3.5.8"
   PQ_FLAGS: "-gssencmode-disable"
 
 concurrency:
@@ -33,9 +33,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Start minimal: only the platforms turbo's granian-python314t
-        # container actually pulls from. Expand once green.
+        # Only the platforms the granian-python314t/315t bases pull from.
         arch: [x86_64]
+        pyver: [cp314t, cp315t]
         platform: [manylinux, musllinux]
 
     steps:
@@ -50,18 +50,16 @@ jobs:
       - name: Create the binary package source tree
         run: python3 ./tools/ci/copy_to_binary.py
 
-      - name: Build cp314t wheel
-        uses: pypa/cibuildwheel@v3.4.1
+      - name: Build ${{ matrix.pyver }} wheel
+        uses: pypa/cibuildwheel@v4.3.5
         with:
           package-dir: psycopg_binary
         env:
-          CIBW_MANYLINUX_X86_64_IMAGE: manylinux2014
-          CIBW_BUILD: cp314t-${{ matrix.platform }}_${{ matrix.arch }}
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_BUILD: ${{ matrix.pyver }}-${{ matrix.platform }}_${{ matrix.arch }}
           CIBW_ARCHS_LINUX: ${{ matrix.arch }}
-          # cibuildwheel 3.x: explicitly opt the free-threaded interpreter
-          # into the build selection. Listing cp314t in CIBW_BUILD is
-          # necessary but not sufficient — without this it gets filtered.
-          CIBW_ENABLE: cpython-freethreading
+          # cibuildwheel 4 builds free-threaded interpreters by default (the 3.x
+          # CIBW_ENABLE=cpython-freethreading opt-in group was removed).
           CIBW_BEFORE_ALL_LINUX: ./tools/ci/wheel_linux_before_all.sh
           CIBW_REPAIR_WHEEL_COMMAND: >-
             ./tools/ci/strip_wheel.sh {wheel}
@@ -96,7 +94,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: psycopg-binary-cp314t-${{ matrix.platform }}_${{ matrix.arch }}
+          name: psycopg-binary-${{ matrix.pyver }}-${{ matrix.platform }}_${{ matrix.arch }}
           path: ./wheelhouse/*.whl
           if-no-files-found: error
 
@@ -107,5 +105,5 @@ jobs:
       - name: Merge artifacts
         uses: actions/upload-artifact/merge@v7
         with:
-          name: psycopg-binary-cp314t
+          name: psycopg-binary-ft
           delete-merged: true
