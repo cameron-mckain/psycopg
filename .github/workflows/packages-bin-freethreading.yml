@@ -111,3 +111,110 @@ jobs:
         with:
           name: psycopg-binary-ft
           delete-merged: true
+
+  # Real smoke test of the built manylinux wheels on free-threaded CPython (manylinux_2_34
+  # ships /opt/python/cp314-cp314t and cp315-cp315t) against a Postgres 18 service:
+  # binary impl, sync/async/COPY/statement_timeout, 16 threads, GIL must stay off.
+  smoke_test:
+    name: Smoke test (${{ matrix.pyver }})
+    needs: [merge]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pyver: cp314t
+            python: /opt/python/cp314-cp314t/bin/python3.14t
+          - pyver: cp315t
+            python: /opt/python/cp315-cp315t/bin/python3.15t
+    container: quay.io/pypa/manylinux_2_34_x86_64:latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: pw
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s
+          --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: psycopg-binary-ft
+          path: wheelhouse
+
+      - name: Install wheel + matching psycopg
+        run: |
+          ls -la wheelhouse
+          ${{ matrix.python }} -m pip install wheelhouse/psycopg_binary-*-${{ matrix.pyver == 'cp314t' && 'cp314-cp314t' || 'cp315-cp315t' }}-manylinux*.whl
+          ${{ matrix.python }} -m pip install "psycopg==3.3.6"
+
+      - name: Smoke test
+        env:
+          DSN: "host=postgres user=postgres password=pw dbname=postgres connect_timeout=5"
+        run: |
+          ${{ matrix.python }} - <<'EOF'
+          import asyncio, os, sys, threading
+          import importlib.metadata as md
+          import psycopg
+          DSN = os.environ["DSN"]
+          print("psycopg", psycopg.__version__, "binary", md.version("psycopg-binary"),
+                "impl", psycopg.pq.__impl__, "libpq", psycopg.pq.version(), "GIL", sys._is_gil_enabled())
+          assert psycopg.pq.__impl__ == "binary"
+          assert md.version("psycopg-binary") == psycopg.__version__
+          with psycopg.connect(DSN) as c:
+              c.execute("SET statement_timeout = 2000")
+              assert c.execute("SELECT 1 + 1").fetchone()[0] == 2
+              try:
+                  c.execute("SELECT pg_sleep(5)")
+                  raise SystemExit("statement_timeout did not fire")
+              except psycopg.errors.QueryCanceled:
+                  c.rollback()
+              with c.cursor().copy("COPY (SELECT g FROM generate_series(1, 1000) g) TO STDOUT") as cp:
+                  assert sum(1 for _ in cp.rows()) == 1000
+          async def amain():
+              async with await psycopg.AsyncConnection.connect(DSN) as ac:
+                  cur = await ac.execute("SELECT 41 + 1")
+                  assert (await cur.fetchone())[0] == 42
+          asyncio.run(amain())
+          errs = []
+          def worker(i):
+              try:
+                  with psycopg.connect(DSN) as c:
+                      for _ in range(50):
+                          assert c.execute("SELECT %s::int * 2", (i,)).fetchone()[0] == i * 2
+              except Exception as e:  # noqa: BLE001
+                  errs.append(repr(e))
+          ts = [threading.Thread(target=worker, args=(i,)) for i in range(16)]
+          [t.start() for t in ts]; [t.join() for t in ts]
+          assert not errs, errs
+          assert not sys._is_gil_enabled(), "GIL was re-enabled"
+          print("ALL OK: sync/async/COPY/timeout/16 threads, GIL off")
+          EOF
+
+  # Publish the tested wheels as a permanent release (granian-python wheels/ pins these)
+  # instead of relying on 90-day workflow artifacts.
+  publish_release:
+    name: Publish release v3.3.6-ft1
+    needs: [smoke_test]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: psycopg-binary-ft
+          path: wheelhouse
+
+      - name: Create or replace release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v3.3.6-ft1
+        run: |
+          (cd wheelhouse && sha256sum *.whl > SHA256SUMS)
+          cat wheelhouse/SHA256SUMS
+          gh release delete "$TAG" --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release create "$TAG" wheelhouse/*.whl wheelhouse/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "psycopg-binary 3.3.6 (free-threading cp314t/cp315t)" \
+            --notes "psycopg-binary 3.3.6 for free-threaded CPython 3.14t / 3.15t (manylinux_2_28 + musllinux, x86_64). Upstream 3.3.6 tag + CI only (libpq ${LIBPQ_VERSION}, OpenSSL ${OPENSSL_VERSION}). Built by cibuildwheel 4.3.5 in run $GITHUB_RUN_ID; smoke-tested against Postgres 18 with the GIL off."
